@@ -85,6 +85,9 @@ class ChatMessageToolCall:
     id: str
     type: str
 
+    def __str__(self) -> str:
+        return f"Call: {self.id}: Calling {str(self.function.name)} with arguments: {str(self.function.arguments)}"
+
 
 @dataclass
 class ChatMessage:
@@ -134,6 +137,16 @@ class ChatMessageStreamDelta:
     content: str | None = None
     tool_calls: list[ChatMessageToolCall] | None = None
     token_usage: TokenUsage | None = None
+
+
+@dataclass
+class ToolCallStreamDelta:
+    """Represents a streaming delta for tool calls during generation."""
+
+    index: int | None = None
+    id: str | None = None
+    type: str | None = None
+    function: dict[str, Any] | None = None
 
 
 class MessageRole(str, Enum):
@@ -1219,7 +1232,7 @@ class InferenceClientModel(ApiModel):
             Token to use for authentication. This is a duplicated argument from `token` to make [`InferenceClientModel`]
             follow the same pattern as `openai.OpenAI` client. Cannot be used if `token` is set. Defaults to None.
         bill_to (`str`, *optional*):
-            The billing account to use for the requests. By default the requests are billed on the user’s account. Requests can only be billed to
+            The billing account to use for the requests. By default the requests are billed on the user's account. Requests can only be billed to
             an organization the user is a member of, and which has subscribed to Enterprise Hub.
         base_url (`str`, `optional`):
             Base URL to run inference. This is a duplicated argument from `model` to make [`InferenceClientModel`]
@@ -1328,13 +1341,6 @@ class InferenceClientModel(ApiModel):
         tools_to_call_from: list[Tool] | None = None,
         **kwargs,
     ) -> Generator[ChatMessageStreamDelta]:
-        if tools_to_call_from:
-            raise NotImplementedError("Streaming is not yet supported for tool calling")
-        if response_format is not None and self.client_kwargs["provider"] not in STRUCTURED_GENERATION_PROVIDERS:
-            raise ValueError(
-                "InferenceClientModel only supports structured outputs with these providers:"
-                + ", ".join(STRUCTURED_GENERATION_PROVIDERS)
-            )
         completion_kwargs = self._prepare_completion_kwargs(
             messages=messages,
             stop_sequences=stop_sequences,
@@ -1345,18 +1351,67 @@ class InferenceClientModel(ApiModel):
             convert_images_to_image_urls=True,
             **kwargs,
         )
+
+        # Track accumulated tool calls and content
+        accumulated_tool_calls = {}
+        current_content = ""
+
         for event in self.client.chat.completions.create(
             **completion_kwargs, stream=True, stream_options={"include_usage": True}
         ):
             if event.choices:
-                if event.choices[0].delta is None:
-                    if not getattr(event.choices[0], "finish_reason", None):
+                choice = event.choices[0]
+                if choice.delta is None:
+                    if not getattr(choice, "finish_reason", None):
                         raise ValueError(f"No content or tool calls in event: {event}")
                 else:
-                    yield ChatMessageStreamDelta(
-                        content=event.choices[0].delta.content,
-                    )
-            if getattr(event, "usage", None):
+                    delta = choice.delta
+
+                    # Handle content streaming
+                    if delta.content:
+                        current_content += delta.content
+                        yield ChatMessageStreamDelta(content=delta.content)
+
+                    # Handle tool call streaming
+                    if delta.tool_calls:
+                        for tool_call_delta in delta.tool_calls:  # ?ormally there should be only one call at a time
+                            # Extend accumulated_tool_calls list to accommodate the new tool call if needed
+                            while len(accumulated_tool_calls) <= tool_call_delta.index:
+                                accumulated_tool_calls[tool_call_delta.index] = {
+                                    "id": None,
+                                    "type": None,
+                                    "function": {"name": None, "arguments": ""},
+                                }
+
+                            # Update the tool call at the specific index
+                            tool_call = accumulated_tool_calls[tool_call_delta.index]
+
+                            if tool_call_delta.id:
+                                tool_call["id"] = tool_call_delta.index
+                            if tool_call_delta.type:
+                                tool_call["type"] = tool_call_delta.type
+                            if tool_call_delta.function:
+                                if tool_call_delta.function.name:
+                                    tool_call["function"]["name"] = tool_call_delta.function.name
+                                if tool_call_delta.function.arguments:
+                                    tool_call["function"]["arguments"] += tool_call_delta.function.arguments
+
+                        yield ChatMessageStreamDelta(
+                            content=current_content,
+                            tool_calls=[
+                                ToolCallStreamDelta(
+                                    id=tool_call["id"],
+                                    type=tool_call["type"],
+                                    function=ChatMessageToolCallDefinition(
+                                        name=tool_call["function"]["name"],
+                                        arguments=tool_call["function"]["arguments"],
+                                    ),
+                                )
+                                for tool_call in accumulated_tool_calls.values()
+                            ],
+                        )
+
+            if event.usage:
                 self._last_input_token_count = event.usage.prompt_tokens
                 self._last_output_token_count = event.usage.completion_tokens
                 yield ChatMessageStreamDelta(
@@ -1446,8 +1501,6 @@ class OpenAIServerModel(ApiModel):
         tools_to_call_from: list[Tool] | None = None,
         **kwargs,
     ) -> Generator[ChatMessageStreamDelta]:
-        if tools_to_call_from:
-            raise NotImplementedError("Streaming is not yet supported for tool calling")
         completion_kwargs = self._prepare_completion_kwargs(
             messages=messages,
             stop_sequences=stop_sequences,
@@ -1458,15 +1511,66 @@ class OpenAIServerModel(ApiModel):
             convert_images_to_image_urls=True,
             **kwargs,
         )
+
+        # Track accumulated tool calls and content
+        accumulated_tool_calls = {}
+        current_content = ""
+
         for event in self.client.chat.completions.create(
             **completion_kwargs, stream=True, stream_options={"include_usage": True}
         ):
             if event.choices:
-                if event.choices[0].delta is None:
-                    if not getattr(event.choices[0], "finish_reason", None):
+                choice = event.choices[0]
+                if choice.delta is None:
+                    if not getattr(choice, "finish_reason", None):
                         raise ValueError(f"No content or tool calls in event: {event}")
                 else:
-                    yield ChatMessageStreamDelta(content=event.choices[0].delta.content)
+                    delta = choice.delta
+
+                    # Handle content streaming
+                    if delta.content:
+                        current_content += delta.content
+                        yield ChatMessageStreamDelta(content=delta.content)
+
+                    # Handle tool call streaming
+                    if delta.tool_calls:
+                        for tool_call_delta in delta.tool_calls:  # ?ormally there should be only one call at a time
+                            # Extend accumulated_tool_calls list to accommodate the new tool call if needed
+                            while len(accumulated_tool_calls) <= tool_call_delta.index:
+                                accumulated_tool_calls[tool_call_delta.index] = {
+                                    "id": None,
+                                    "type": None,
+                                    "function": {"name": None, "arguments": ""},
+                                }
+
+                            # Update the tool call at the specific index
+                            tool_call = accumulated_tool_calls[tool_call_delta.index]
+
+                            if tool_call_delta.id:
+                                tool_call["id"] = tool_call_delta.index
+                            if tool_call_delta.type:
+                                tool_call["type"] = tool_call_delta.type
+                            if tool_call_delta.function:
+                                if tool_call_delta.function.name:
+                                    tool_call["function"]["name"] = tool_call_delta.function.name
+                                if tool_call_delta.function.arguments:
+                                    tool_call["function"]["arguments"] += tool_call_delta.function.arguments
+
+                        yield ChatMessageStreamDelta(
+                            content=current_content,
+                            tool_calls=[
+                                ToolCallStreamDelta(
+                                    id=tool_call["id"],
+                                    type=tool_call["type"],
+                                    function=ChatMessageToolCallDefinition(
+                                        name=tool_call["function"]["name"],
+                                        arguments=tool_call["function"]["arguments"],
+                                    ),
+                                )
+                                for tool_call in accumulated_tool_calls.values()
+                            ],
+                        )
+
             if event.usage:
                 self._last_input_token_count = event.usage.prompt_tokens
                 self._last_output_token_count = event.usage.completion_tokens

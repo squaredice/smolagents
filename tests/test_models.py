@@ -21,6 +21,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from huggingface_hub import ChatCompletionOutputMessage
 
+from smolagents.default_tools import FinalAnswerTool
 from smolagents.models import (
     AmazonBedrockServerModel,
     AzureOpenAIServerModel,
@@ -370,6 +371,30 @@ class TestOpenAIServerModel:
             base_url=api_base, api_key=api_key, organization=organization, project=project, max_retries=5
         )
         assert model.client == MockOpenAI.return_value
+
+    @require_run_all
+    def test_streaming_tool_calls(self):
+        model = OpenAIServerModel(model_id="gpt-4o-mini")
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Hello! Please return the final answer 'blob' and the final answer 'blob2' in two parallel tool calls",
+                    }
+                ],
+            }
+        ]
+        for el in model.generate_stream(messages, tools_to_call_from=[FinalAnswerTool()]):
+            if el.tool_calls:
+                assert el.tool_calls[0].function.name == "final_answer"
+                args = el.tool_calls[0].function.arguments
+                if len(el.tool_calls) > 1:
+                    assert el.tool_calls[1].function.name == "final_answer"
+                    args2 = el.tool_calls[1].function.arguments
+        assert args == '{"answer": "blob"}'
+        assert args2 == '{"answer": "blob2"}'
 
 
 class TestAmazonBedrockServerModel:

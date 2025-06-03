@@ -686,7 +686,8 @@ You have been provided with these additional arguments, that you can access usin
     def _step_stream(self, memory_step: ActionStep) -> Generator[ChatMessageStreamDelta | FinalOutput]:
         """
         Perform one step in the ReAct framework: the agent thinks, acts, and observes the result.
-        Yields either None if the step is not final, or the final answer.
+        Yields ChatMessageStreamDelta during the run if streaming is enabled.
+        At the end, yields either None if the step is not final, or the final answer.
         """
         raise NotImplementedError("This method should be implemented in child classes")
 
@@ -1149,18 +1150,20 @@ class ToolCallingAgent(MultiStepAgent):
 
     Args:
         tools (`list[Tool]`): [`Tool`]s that the agent can use.
-        model (`Callable[[list[dict[str, str]]], ChatMessage]`): Model that will generate the agent's actions.
+        model (`Model`): Model that will generate the agent's actions.
         prompt_templates ([`~agents.PromptTemplates`], *optional*): Prompt templates.
         planning_interval (`int`, *optional*): Interval at which the agent will run a planning step.
+        stream_outputs (`bool`, *optional*, default `False`): Whether to stream outputs during execution.
         **kwargs: Additional keyword arguments.
     """
 
     def __init__(
         self,
         tools: list[Tool],
-        model: Callable[[list[dict[str, str]]], ChatMessage],
+        model: Model,
         prompt_templates: PromptTemplates | None = None,
         planning_interval: int | None = None,
+        stream_outputs: bool = False,
         **kwargs,
     ):
         prompt_templates = prompt_templates or yaml.safe_load(
@@ -1174,6 +1177,13 @@ class ToolCallingAgent(MultiStepAgent):
             **kwargs,
         )
 
+        # Streaming setup
+        self.stream_outputs = stream_outputs
+        if self.stream_outputs and not hasattr(self.model, "generate_stream"):
+            raise ValueError(
+                "`stream_outputs` is set to True, but the model class implements no `generate_stream` method."
+            )
+
     def initialize_system_prompt(self) -> str:
         system_prompt = populate_template(
             self.prompt_templates["system_prompt"],
@@ -1181,10 +1191,11 @@ class ToolCallingAgent(MultiStepAgent):
         )
         return system_prompt
 
-    def _step_stream(self, memory_step: ActionStep) -> Generator[FinalOutput]:
+    def _step_stream(self, memory_step: ActionStep) -> Generator[ChatMessageStreamDelta | FinalOutput]:
         """
         Perform one step in the ReAct framework: the agent thinks, acts, and observes the result.
-        Yields either None if the step is not final, or the final answer.
+        Yields ChatMessageStreamDelta during the run if streaming is enabled.
+        At the end, yields either None if the step is not final, or the final answer.
         """
         memory_messages = self.write_memory_to_messages()
 
@@ -1194,20 +1205,57 @@ class ToolCallingAgent(MultiStepAgent):
         memory_step.model_input_messages = input_messages
 
         try:
-            chat_message: ChatMessage = self.model.generate(
-                input_messages,
-                stop_sequences=["Observation:", "Calling tools:"],
-                tools_to_call_from=list(self.tools.values()),
-            )
-            memory_step.model_output_message = chat_message
-            model_output = chat_message.content
-            self.logger.log_markdown(
-                content=model_output if model_output else str(chat_message.raw),
-                title="Output message of the LLM:",
-                level=LogLevel.DEBUG,
-            )
+            if self.stream_outputs and hasattr(self.model, "generate_stream"):
+                output_stream = self.model.generate_stream(
+                    input_messages,
+                    stop_sequences=["Observation:", "Calling tools:"],
+                    tools_to_call_from=list(self.tools.values()),
+                )
 
-            memory_step.model_output_message.content = model_output
+                model_output = ""
+                input_tokens, output_tokens = 0, 0
+                tool_calls = {}
+
+                with Live("", console=self.logger.console, vertical_overflow="visible") as live:
+                    for event in output_stream:
+                        if event.content is not None:
+                            model_output += event.content
+                            if event.token_usage:
+                                output_tokens += event.token_usage.output_tokens
+                                input_tokens = event.token_usage.input_tokens
+                        if event.tool_calls:
+                            tool_calls.update({tool_call.id: tool_call for tool_call in event.tool_calls})
+                        # Propagate the streaming delta
+                        live.update(
+                            Markdown(model_output + "\n".join([str(tool_call) for tool_call in tool_calls.values()]))
+                        )
+                        yield event
+
+                chat_message = ChatMessage(
+                    role=MessageRole.ASSISTANT,
+                    content=model_output,
+                    token_usage=TokenUsage(
+                        input_tokens=input_tokens,
+                        output_tokens=output_tokens,
+                    ),
+                    tool_calls=list(tool_calls.values()),
+                )
+            else:
+                chat_message: ChatMessage = self.model.generate(
+                    input_messages,
+                    stop_sequences=["Observation:", "Calling tools:"],
+                    tools_to_call_from=list(self.tools.values()),
+                )
+
+                model_output = chat_message.content
+                self.logger.log_markdown(
+                    content=model_output if model_output else str(chat_message.raw),
+                    title="Output message of the LLM:",
+                    level=LogLevel.DEBUG,
+                )
+
+            # Record model output
+            memory_step.model_output_message = chat_message
             memory_step.model_output = model_output
         except Exception as e:
             raise AgentGenerationError(f"Error while generating output:\n{e}", self.logger) from e

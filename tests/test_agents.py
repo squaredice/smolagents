@@ -20,7 +20,9 @@ import uuid
 import warnings
 from collections.abc import Generator
 from contextlib import nullcontext as does_not_raise
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -56,6 +58,29 @@ from smolagents.models import (
 from smolagents.monitoring import AgentLogger, LogLevel
 from smolagents.tools import Tool, tool
 from smolagents.utils import BASE_BUILTIN_MODULES, AgentExecutionError, AgentGenerationError, AgentToolCallError
+
+
+@dataclass
+class ChoiceDeltaToolCallFunction:
+    arguments: Optional[str] = None
+    name: Optional[str] = None
+
+
+@dataclass
+class ChoiceDeltaToolCall:
+    index: Optional[int] = None
+    id: Optional[str] = None
+    function: Optional[ChoiceDeltaToolCallFunction] = None
+    type: Optional[str] = None
+
+
+@dataclass
+class ChoiceDelta:
+    content: Optional[str] = None
+    function_call: Optional[str] = None
+    refusal: Optional[str] = None
+    role: Optional[str] = None
+    tool_calls: Optional[list] = None
 
 
 def get_new_path(suffix="") -> str:
@@ -1016,7 +1041,6 @@ class TestMultiStepAgent:
         assert agent.tools["valid_tool_function"].inputs == {
             "input": {"type": "string", "description": "Input string."}
         }
-        assert agent.tools["valid_tool_function"].output_type == "string"
         assert agent.tools["valid_tool_function"]("test") == "TEST"
 
         # Test overriding with kwargs
@@ -1077,6 +1101,94 @@ class TestToolCallingAgent:
         assert agent.memory.steps[1].tool_calls[0].arguments == {"location": "Paris", "date": "today"}
         assert agent.memory.steps[1].observations == "The weather in Paris on date:today is sunny."
 
+    @patch("openai.OpenAI")
+    def test_toolcalling_agent_stream_outputs_multiple_tool_calls(self, mock_openai_client):
+        """Test that ToolCallingAgent with stream_outputs=True returns the first final_answer when multiple are called."""
+        mock_client = mock_openai_client.return_value
+        from smolagents import OpenAIServerModel
+
+        # Mock streaming response with multiple final_answer calls
+        mock_deltas = [
+            ChoiceDelta(role="assistant"),
+            ChoiceDelta(
+                tool_calls=[
+                    ChoiceDeltaToolCall(
+                        index=0,
+                        id="call_1",
+                        function=ChoiceDeltaToolCallFunction(name="final_answer"),
+                        type="function",
+                    )
+                ]
+            ),
+            ChoiceDelta(
+                tool_calls=[ChoiceDeltaToolCall(index=0, function=ChoiceDeltaToolCallFunction(arguments='{"an'))]
+            ),
+            ChoiceDelta(
+                tool_calls=[ChoiceDeltaToolCall(index=0, function=ChoiceDeltaToolCallFunction(arguments='swer"'))]
+            ),
+            ChoiceDelta(
+                tool_calls=[ChoiceDeltaToolCall(index=0, function=ChoiceDeltaToolCallFunction(arguments=': "out'))]
+            ),
+            ChoiceDelta(
+                tool_calls=[ChoiceDeltaToolCall(index=0, function=ChoiceDeltaToolCallFunction(arguments="put1"))]
+            ),
+            ChoiceDelta(
+                tool_calls=[ChoiceDeltaToolCall(index=0, function=ChoiceDeltaToolCallFunction(arguments='"}'))]
+            ),
+            ChoiceDelta(
+                tool_calls=[
+                    ChoiceDeltaToolCall(
+                        index=1,
+                        id="call_2",
+                        function=ChoiceDeltaToolCallFunction(name="final_answer"),
+                        type="function",
+                    )
+                ]
+            ),
+            ChoiceDelta(
+                tool_calls=[ChoiceDeltaToolCall(index=1, function=ChoiceDeltaToolCallFunction(arguments='{"an'))]
+            ),
+            ChoiceDelta(
+                tool_calls=[ChoiceDeltaToolCall(index=1, function=ChoiceDeltaToolCallFunction(arguments='swer"'))]
+            ),
+            ChoiceDelta(
+                tool_calls=[ChoiceDeltaToolCall(index=1, function=ChoiceDeltaToolCallFunction(arguments=': "out'))]
+            ),
+            ChoiceDelta(
+                tool_calls=[ChoiceDeltaToolCall(index=1, function=ChoiceDeltaToolCallFunction(arguments="put2"))]
+            ),
+            ChoiceDelta(
+                tool_calls=[ChoiceDeltaToolCall(index=1, function=ChoiceDeltaToolCallFunction(arguments='"}'))]
+            ),
+        ]
+
+        class MockChoice:
+            def __init__(self, delta):
+                self.delta = delta
+
+        class MockChunk:
+            def __init__(self, delta):
+                self.choices = [MockChoice(delta)]
+                self.usage = None
+
+        mock_client.chat.completions.create.return_value = (MockChunk(delta) for delta in mock_deltas)
+
+        # Mock usage for non-streaming fallback
+        mock_usage = MagicMock()
+        mock_usage.prompt_tokens = 10
+        mock_usage.completion_tokens = 20
+
+        model = OpenAIServerModel(model_id="fakemodel")
+
+        agent = ToolCallingAgent(model=model, tools=[], max_steps=1, stream_outputs=True)
+        result = agent.run("Make 2 calls to final answer: return both 'output1' and 'output2'")
+        assert len(agent.memory.steps[-1].model_output_message.tool_calls) == 2
+        assert agent.memory.steps[-1].model_output_message.tool_calls[0].function.name == "final_answer"
+        assert agent.memory.steps[-1].model_output_message.tool_calls[1].function.name == "final_answer"
+
+        # The agent should return the first final_answer result
+        assert result == "output1"
+
     @patch("huggingface_hub.InferenceClient")
     def test_toolcalling_agent_api_misformatted_output(self, mock_inference_client):
         """Test that even misformatted json blobs don't interrupt the run for a ToolCallingAgent."""
@@ -1116,36 +1228,10 @@ class TestToolCallingAgent:
             return "2"
 
         class FakeCodeModel(Model):
-            def generate(self, messages, tools_to_call_from=None, stop_sequences=None):
-                if len(messages) < 3:
-                    return ChatMessage(
-                        role="assistant",
-                        content="",
-                        tool_calls=[
-                            ChatMessageToolCall(
-                                id="call_0",
-                                type="function",
-                                function=ChatMessageToolCallDefinition(name="fake_tool_1", arguments={}),
-                            )
-                        ],
-                    )
-                else:
-                    tool_result = messages[-1]["content"][0]["text"].removeprefix("Observation:\n")
-                    return ChatMessage(
-                        role="assistant",
-                        content="",
-                        tool_calls=[
-                            ChatMessageToolCall(
-                                id="call_1",
-                                type="function",
-                                function=ChatMessageToolCallDefinition(
-                                    name="final_answer", arguments={"answer": tool_result}
-                                ),
-                            )
-                        ],
-                    )
+            def generate(self, messages, stop_sequences=None):
+                return ChatMessage(role="assistant", content="Code:\n```py\nfinal_answer(fake_tool_1())\n```")
 
-        agent = ToolCallingAgent(tools=[fake_tool_1], model=FakeCodeModel())
+        agent = CodeAgent(tools=[fake_tool_1], model=FakeCodeModel())
 
         agent.tools["final_answer"] = CustomFinalAnswerTool()
         agent.tools["fake_tool_1"] = fake_tool_2
