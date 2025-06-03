@@ -33,7 +33,7 @@ from typing import TYPE_CHECKING, Any, Literal, TypedDict
 import jinja2
 import yaml
 from huggingface_hub import create_repo, metadata_update, snapshot_download, upload_folder
-from jinja2 import StrictUndefined, Template
+from jinja2 import StrictUndefined, Template, Environment, select_autoescape
 from rich.console import Group
 from rich.live import Live
 from rich.markdown import Markdown
@@ -101,7 +101,8 @@ def get_variable_names(self, template: str) -> set[str]:
 
 
 def populate_template(template: str, variables: dict[str, Any]) -> str:
-    compiled_template = Template(template, undefined=StrictUndefined)
+    env = Environment(autoescape=select_autoescape(['html', 'xml']), undefined=StrictUndefined)
+    compiled_template = env.from_string(template)
     try:
         return compiled_template.render(**variables)
     except Exception as e:
