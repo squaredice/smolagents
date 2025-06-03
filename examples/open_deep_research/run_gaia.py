@@ -68,6 +68,7 @@ user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTM
 BROWSER_CONFIG = {
     "viewport_size": 1024 * 5,
     "downloads_folder": "downloads_folder",
+    "safe_root": "./downloads",
     "request_kwargs": {
         "headers": {"User-Agent": user_agent},
         "timeout": 300,
@@ -75,7 +76,10 @@ BROWSER_CONFIG = {
     "serpapi_key": os.getenv("SERPAPI_API_KEY"),
 }
 
-os.makedirs(f"./{BROWSER_CONFIG['downloads_folder']}", exist_ok=True)
+downloads_path = os.path.normpath(os.path.join(BROWSER_CONFIG["safe_root"], BROWSER_CONFIG["downloads_folder"]))
+if not downloads_path.startswith(os.path.abspath(BROWSER_CONFIG["safe_root"])):
+    raise ValueError("Invalid downloads folder path")
+os.makedirs(downloads_path, exist_ok=True)
 
 
 def create_agent_team(model: Model):
