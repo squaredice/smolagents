@@ -897,7 +897,7 @@ You have been provided with these additional arguments, that you can access usin
             if __name__ == "__main__":
                 GradioUI({{ agent_name }}).launch()
             """).strip()
-        template_env = jinja2.Environment(loader=jinja2.BaseLoader(), undefined=jinja2.StrictUndefined)
+        template_env = jinja2.Environment(loader=jinja2.BaseLoader(), undefined=jinja2.StrictUndefined, autoescape=True)
         template_env.filters["repr"] = repr
         template_env.filters["camelcase"] = lambda value: "".join(word.capitalize() for word in value.split("_"))
         template = template_env.from_string(app_template)
