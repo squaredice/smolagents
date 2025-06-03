@@ -196,8 +196,17 @@ def answer_questions(
     date = date or datetime.date.today().isoformat()
     model_id = model.model_id
 
+    # Validate action_type against an allowlist
+    allowed_action_types = {"code", "search", "interpret"}
+    if action_type not in allowed_action_types:
+        raise ValueError(f"Invalid action_type: {action_type}")
+
     for task in eval_ds:
-        file_name = f"{output_dir}/{model_id.replace('/', '__')}__{action_type}__{task}__{date}.jsonl"
+        raw_file_name = f"{output_dir}/{model_id.replace('/', '__')}__{action_type}__{task}__{date}.jsonl"
+        file_name = os.path.normpath(raw_file_name)
+        if not file_name.startswith(os.path.abspath(output_dir)):
+            raise ValueError(f"Unsafe file path detected: {file_name}")
+
         print(f"Starting processing and writing output to '{file_name}'")
         answered_questions = []
         if os.path.exists(file_name):
